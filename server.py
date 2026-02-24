@@ -1,10 +1,9 @@
 import os
 from flask import Flask, request, jsonify
-import google.generativeai as genai
+from google import genai
 
 app = Flask(__name__)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 sessions = {}
 
@@ -18,7 +17,7 @@ def ask():
     health = data.get("health", 100)
 
     if player not in sessions:
-        sessions[player] = model.start_chat(history=[])
+        sessions[player] = []
 
     prompt = f"""
 Ты живой NPC по имени VRIX в Roblox.
@@ -29,21 +28,24 @@ def ask():
 Ты живёшь своей жизнью — гуляешь, берёшь предметы, строишь, катаешься на машине.
 Реагируй на игроков и на окружение.
 
-Команды которые ты можешь использовать:
+Команды:
 [GRAB: название] — взять предмет
-[DROP] — бросить что держишь
+[DROP] — бросить
 [SHOOT] — выстрелить
-[WANDER] — просто погулять
-[BUILD] — начать строить
+[WANDER] — погулять
+[BUILD] — строить
 [DRIVE] — сесть в машину
 
-Отвечай коротко, живо, на русском. Можешь делать несколько действий сразу.
+Отвечай коротко, живо, на русском.
 
 Игрок {player} говорит: {message}
     """
 
     try:
-        response = sessions[player].send_message(prompt)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-preview-04-17",
+            contents=prompt
+        )
         reply = response.text
 
         actions = []
@@ -69,4 +71,4 @@ def ask():
         return jsonify({"reply": "...", "actions": [], "error": str(e)})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
