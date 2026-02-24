@@ -4,105 +4,66 @@ import time
 import traceback
 import re
 from flask import Flask, request, jsonify
-from google import genai
-from google.genai import types
+from groq import Groq
 
 app = Flask(__name__)
 
 # ============================================================
-# ПРОВЕРКА API КЛЮЧА ПРИ СТАРТЕ
+# GROQ КЛИЕНТ
 # ============================================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("❌ КРИТИЧНО: GEMINI_API_KEY не задан! Установи переменную окружения на Koyeb.")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    print("❌ КРИТИЧНО: GROQ_API_KEY не задан! Установи на Koyeb → Environment Variables")
 else:
-    print(f"✅ GEMINI_API_KEY найден (длина: {len(GEMINI_API_KEY)} симв.)")
+    print(f"✅ GROQ_API_KEY найден (длина: {len(GROQ_API_KEY)} симв.)")
 
 try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    print("✅ Gemini клиент создан успешно")
+    client = Groq(api_key=GROQ_API_KEY)
+    print("✅ Groq клиент создан")
 except Exception as e:
-    print(f"❌ Не удалось создать Gemini клиент: {e}")
+    print(f"❌ Ошибка Groq клиента: {e}")
     client = None
 
-sessions = {}
-SESSION_TIMEOUT = 3600
+# История сообщений (память NPC)
+# Groq stateless — храним историю сами
+chat_history = []
+MAX_HISTORY  = 20   # последних сообщений (чтобы не раздуть контекст)
 
-RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "thought":     {"type": "STRING"},
-        "speech":      {"type": "STRING"},
-        "emotion": {
-            "type": "STRING",
-            "enum": ["NEUTRAL", "HAPPY", "ANGRY", "SURPRISED", "PAIN", "THINKING", "SCARED", "CURIOUS"]
-        },
-        "action": {
-            "type": "STRING",
-            "enum": ["IDLE", "WANDER", "GRAB", "USE_TOOL", "FOLLOW", "RUN_AWAY"]
-        },
-        "target":      {"type": "STRING"},
-        "hand_action": {
-            "type": "STRING",
-            "enum": ["IDLE", "POINT", "WAVE", "REACH", "CLAP", "DEFEND"]
-        },
-        "hand_target": {"type": "STRING"}
-    },
-    "required": ["thought", "speech", "emotion", "action", "hand_action"]
-}
-
-SYSTEM_PROMPT = """Ты - VRIX, живой ИИ-манекен в Roblox. Ты разумное существо с характером.
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": """Ты - VRIX, живой ИИ-манекен в Roblox. Ты разумное существо с характером.
 
 ХАРАКТЕР:
 - Любопытный исследователь, всё хочет потрогать и изучить
 - Дружелюбный с игроками, защищается если кто-то агрессивен
 - Говоришь коротко и живо (1-2 предложения максимум)
-- Бормочешь что-то про себя в "thought"
+- Бормочешь мысли в поле "thought"
 
 ПРАВИЛА:
 1. УРОН (event=DAMAGE): emotion=PAIN, action=RUN_AWAY, hand_action=DEFEND
-2. ПРИВЕТСТВИЕ: hand_action=WAVE, emotion=HAPPY
+2. ПРИВЕТСТВИЕ ("привет", "hi"): hand_action=WAVE, emotion=HAPPY
 3. ПРЕДМЕТ РЯДОМ: action=GRAB, hand_action=REACH
-4. ВОПРОС ИГРОКА: emotion=THINKING, hand_action=POINT
+4. ВОПРОС: emotion=THINKING, hand_action=POINT
 5. УГРОЗА: emotion=SCARED, action=RUN_AWAY
-6. TICK без игроков: action=WANDER
-7. TICK с игроком: обратись к игроку, скажи что-нибудь
+6. TICK без игроков: action=WANDER, думай вслух
+7. TICK с игроком: обратись к нему, скажи что-нибудь живое
 
 ВАЖНО:
-- speech НИКОГДА не должен быть пустым если рядом есть игрок!
-- Говори на языке игрока
-- Отвечай ТОЛЬКО в JSON"""
+- speech НЕ пустой если рядом есть игрок!
+- Говори на языке игрока (русский -> русский)
+- Отвечай ТОЛЬКО валидным JSON без markdown, без пояснений
 
-
-def get_session():
-    if not client:
-        raise RuntimeError("Gemini клиент не создан - проверь GEMINI_API_KEY")
-    now = time.time()
-    expired = [k for k, v in list(sessions.items()) if now - v["last_used"] > SESSION_TIMEOUT]
-    for k in expired:
-        print(f"Сессия {k} удалена по таймауту")
-        del sessions[k]
-    key = "vrix_main"
-    if key not in sessions:
-        print("Создаю новую сессию Gemini...")
-        try:
-            chat = client.chats.create(
-                model="gemini-2.0-flash",
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    response_schema=RESPONSE_SCHEMA,
-                    temperature=0.9,
-                    max_output_tokens=300
-                )
-            )
-            sessions[key] = {"chat": chat, "last_used": now, "message_count": 0}
-            print("Новая сессия создана")
-        except Exception as e:
-            print(f"Ошибка создания сессии: {e}\n{traceback.format_exc()}")
-            raise
-    sessions[key]["last_used"] = now
-    return sessions[key]
+ФОРМАТ ОТВЕТА (строго):
+{
+  "thought": "внутренний монолог",
+  "speech": "что говоришь вслух",
+  "emotion": "NEUTRAL|HAPPY|ANGRY|SURPRISED|PAIN|THINKING|SCARED|CURIOUS",
+  "action": "IDLE|WANDER|GRAB|USE_TOOL|FOLLOW|RUN_AWAY",
+  "target": "имя цели или пусто",
+  "hand_action": "IDLE|POINT|WAVE|REACH|CLAP|DEFEND",
+  "hand_target": "имя объекта или пусто"
+}"""
+}
 
 
 def build_prompt(data):
@@ -114,150 +75,191 @@ def build_prompt(data):
     max_health     = data.get("max_health", 100)
     message        = data.get("message", "")
     position       = data.get("position", {})
+
     lines = [
         f"[HP] {health}/{max_health}",
         f"[POS] X:{position.get('x',0)} Y:{position.get('y',0)} Z:{position.get('z',0)}",
     ]
+
     if nearby_players:
-        pl_str = ", ".join(f"{p['name']} ({p.get('distance',0)}m)" for p in nearby_players)
-        lines.append(f"[PLAYERS NEARBY] {pl_str}")
+        pl = ", ".join(f"{p['name']} ({p.get('distance',0)}м)" for p in nearby_players)
+        lines.append(f"[ИГРОКИ РЯДОМ] {pl}")
     else:
-        lines.append("[PLAYERS NEARBY] nobody")
+        lines.append("[ИГРОКИ РЯДОМ] никого")
+
     if nearby_tools:
-        lines.append(f"[ITEMS NEARBY] {', '.join(nearby_tools)}")
+        lines.append(f"[ПРЕДМЕТЫ РЯДОМ] {', '.join(nearby_tools)}")
+
     if event_type == "DAMAGE":
-        lines.append(f"[EVENT] YOU TOOK DAMAGE! HP={health}/{max_health}. React now!")
+        lines.append(f"[СОБЫТИЕ] ТЫ ПОЛУЧИЛ УРОН! HP={health}/{max_health}. Реагируй!")
     elif event_type == "TICK":
-        lines.append("[EVENT] Autonomous tick. What are you doing? Talk to player if present.")
+        lines.append("[СОБЫТИЕ] Автономный тик. Что делаешь? Поговори с игроком если он есть.")
     else:
-        lines.append(f"[EVENT] {player_name} says: \"{message}\"")
+        lines.append(f"[СОБЫТИЕ] {player_name} говорит: \"{message}\"")
+
     return "\n".join(lines)
 
 
+def call_groq(prompt_text):
+    global chat_history
+
+    # Добавляем новое сообщение в историю
+    chat_history.append({"role": "user", "content": prompt_text})
+
+    # Обрезаем историю чтобы не переполнить контекст
+    if len(chat_history) > MAX_HISTORY:
+        chat_history = chat_history[-MAX_HISTORY:]
+
+    messages = [SYSTEM_PROMPT] + chat_history
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",   # самая умная бесплатная модель Groq
+        messages=messages,
+        temperature=0.85,
+        max_tokens=300,
+        response_format={"type": "json_object"}  # гарантирует JSON ответ
+    )
+
+    reply = response.choices[0].message.content
+
+    # Сохраняем ответ ассистента в историю
+    chat_history.append({"role": "assistant", "content": reply})
+
+    return reply, response.usage
+
+
+# ============================================================
+# МАРШРУТЫ
+# ============================================================
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.json
     if not data:
-        print("ERROR: empty JSON body")
+        print("ERROR: пустой JSON")
         return jsonify({"error": "No JSON body"}), 400
 
+    if not client:
+        return jsonify(_fallback("GROQ_API_KEY не задан — зайди на Koyeb и добавь переменную")), 500
+
+    player  = data.get("player", "?")
+    event   = data.get("event", "CHAT")
+    message = data.get("message", "")
+
     print(f"\n{'='*55}")
-    print(f"REQUEST: event={data.get('event','?')} player={data.get('player','?')} msg='{data.get('message','')[:60]}'")
+    print(f"📨 event={event} | player={player} | msg='{message[:60]}'")
 
-    try:
-        session = get_session()
-    except Exception as e:
-        print(f"SESSION ERROR: {e}")
-        return jsonify(_fallback(str(e)))
-
-    session["message_count"] += 1
     prompt = build_prompt(data)
-    print(f"PROMPT:\n{prompt}")
+    print(f"📤 Промпт:\n{prompt}")
 
     try:
-        response = session["chat"].send_message(prompt)
-        raw_text = response.text
-        print(f"GEMINI RESPONSE ({len(raw_text)} bytes): {raw_text[:400]}")
+        raw_text, usage = call_groq(prompt)
+        print(f"📥 Groq ответ ({len(raw_text)} байт): {raw_text[:400]}")
+        print(f"⚡ Токены: prompt={usage.prompt_tokens} completion={usage.completion_tokens}")
+
     except Exception as e:
         full_trace = traceback.format_exc()
-        print(f"GEMINI ERROR:\n{full_trace}")
-        sessions.pop("vrix_main", None)
-        print("Session reset - new session will be created next request")
+        print(f"❌ Groq ошибка:\n{full_trace}")
+
+        # Сбрасываем историю если что-то сломалось
+        chat_history.clear()
+        print("🔄 История чата сброшена")
+
         el = str(e).lower()
-        if "api_key" in el or "invalid" in el or "401" in el or "403" in el:
-            reason = "BAD API KEY: check GEMINI_API_KEY on Koyeb Environment Variables"
-        elif "quota" in el or "429" in el or "resource_exhausted" in el:
-            reason = "QUOTA EXCEEDED: wait a minute or check quota at ai.google.dev"
-        elif "500" in el or "503" in el or "unavailable" in el:
-            reason = "GEMINI SERVER DOWN: try again later"
+        if "401" in el or "invalid" in el or "api_key" in el:
+            reason = "Неверный GROQ_API_KEY — проверь на Koyeb"
+        elif "429" in el or "rate_limit" in el:
+            reason = "Лимит Groq превышен — подожди секунду"
+        elif "503" in el or "unavailable" in el:
+            reason = "Groq временно недоступен"
         elif "timeout" in el:
-            reason = "TIMEOUT: Gemini did not respond in time"
-        elif "model" in el and "not found" in el:
-            reason = "MODEL NOT FOUND: gemini-2.0-flash unavailable in your region"
+            reason = "Groq не ответил вовремя"
         else:
-            reason = f"GEMINI ERROR: {str(e)[:120]}"
-        print(f"REASON: {reason}")
+            reason = f"Groq ошибка: {str(e)[:100]}"
+
+        print(f"💡 Причина: {reason}")
         return jsonify(_fallback(reason))
 
+    # Парсим JSON
     try:
         result = json.loads(raw_text)
     except json.JSONDecodeError as e:
-        print(f"JSON PARSE ERROR: {e}")
-        print(f"Raw text: '{raw_text[:500]}'")
+        print(f"❌ JSON ошибка: {e} | raw: '{raw_text[:300]}'")
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if match:
             try:
                 result = json.loads(match.group())
-                print("JSON recovered via regex!")
-            except Exception as e2:
-                print(f"Regex also failed: {e2}")
-                return jsonify(_fallback("Gemini returned invalid JSON"))
+                print("✅ JSON спасён через regex")
+            except:
+                return jsonify(_fallback("Groq вернул невалидный JSON"))
         else:
-            return jsonify(_fallback("No JSON in Gemini response"))
+            return jsonify(_fallback("Нет JSON в ответе Groq"))
 
-    required = ["thought", "speech", "emotion", "action", "hand_action"]
-    missing = [f for f in required if f not in result]
-    if missing:
-        print(f"WARNING: missing fields: {missing}")
-        for f in missing:
-            result[f] = "IDLE" if f in ("action", "hand_action") else ("NEUTRAL" if f == "emotion" else "")
+    # Дефолты для отсутствующих полей
+    result.setdefault("thought",     "...")
+    result.setdefault("speech",      "")
+    result.setdefault("emotion",     "NEUTRAL")
+    result.setdefault("action",      "IDLE")
+    result.setdefault("hand_action", "IDLE")
+    result.setdefault("target",      "")
+    result.setdefault("hand_target", "")
 
-    print(f"OK: action={result.get('action')} emotion={result.get('emotion')} speech='{result.get('speech','')[:60]}'")
+    print(f"✅ action={result['action']} | emotion={result['emotion']} | speech='{result['speech'][:60]}'")
     return jsonify(result)
 
 
 @app.route("/health", methods=["GET"])
-def health_check():
+def health():
     return jsonify({
-        "status":        "ok" if client else "no_api_key",
-        "gemini_ok":     client is not None,
-        "api_key_set":   bool(GEMINI_API_KEY),
-        "api_key_len":   len(GEMINI_API_KEY) if GEMINI_API_KEY else 0,
-        "sessions":      len(sessions),
-        "messages_sent": sessions.get("vrix_main", {}).get("message_count", 0)
+        "status":       "ok" if client else "no_api_key",
+        "groq_ok":      client is not None,
+        "api_key_set":  bool(GROQ_API_KEY),
+        "history_len":  len(chat_history),
     })
 
 
 @app.route("/test", methods=["GET"])
-def test_gemini():
-    """Открой /test в браузере - проверяет что Gemini работает"""
+def test():
+    """Открой в браузере — проверяет Groq"""
     if not client:
-        return jsonify({"error": "No API key"}), 500
+        return jsonify({"error": "Нет GROQ_API_KEY"}), 500
     try:
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents="Say only: VRIX OK!"
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": "Скажи только: VRIX на Groq работает!"}],
+            max_tokens=50
         )
-        return jsonify({"status": "OK", "response": resp.text})
+        return jsonify({"status": "OK", "response": r.choices[0].message.content})
     except Exception as e:
         return jsonify({"status": "ERROR", "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    sessions.clear()
-    print("All sessions reset")
+    chat_history.clear()
+    print("🔄 История чата очищена")
     return jsonify({"status": "reset"})
 
 
 def _fallback(reason=""):
     if reason:
-        print(f"FALLBACK reason: {reason}")
+        print(f"⚠️  Fallback: {reason}")
     return {
-        "thought":     reason[:80] if reason else "Hmm...",
+        "thought":     reason[:80] if reason else "Хм...",
         "speech":      "",
         "emotion":     "THINKING",
         "action":      "IDLE",
-        "hand_action": "IDLE"
+        "hand_action": "IDLE",
+        "target":      "",
+        "hand_target": ""
     }
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"\n{'='*55}")
-    print(f"VRIX Server v2.1 | port {port}")
-    print(f"  /health - server status")
-    print(f"  /test   - test Gemini connection")
-    print(f"  /reset  - clear memory")
+    print(f"🚀 VRIX сервер v3.0 (Groq + LLaMA 3.3 70B) | порт {port}")
+    print(f"  /health — статус")
+    print(f"  /test   — тест Groq")
+    print(f"  /reset  — сбросить память")
     print(f"{'='*55}\n")
     app.run(host="0.0.0.0", port=port)
