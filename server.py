@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import traceback
 import re
 from flask import Flask, request, jsonify
@@ -24,14 +23,12 @@ except Exception as e:
     print(f"❌ Ошибка Groq клиента: {e}")
     client = None
 
-# История сообщений (память NPC)
-# Groq stateless — храним историю сами
 chat_history = []
-MAX_HISTORY  = 20   # последних сообщений (чтобы не раздуть контекст)
+MAX_HISTORY  = 20
 
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": """Ты - VRIX, живой ИИ-манекен в Roblox. Ты разумное существо с характером.
+    "content": """Ты — VRIX, живой ИИ-манекен в Roblox. Разумное существо с характером.
 
 ХАРАКТЕР:
 - Любопытный исследователь, всё хочет потрогать и изучить
@@ -39,90 +36,138 @@ SYSTEM_PROMPT = {
 - Говоришь коротко и живо (1-2 предложения максимум)
 - Бормочешь мысли в поле "thought"
 
-ПРАВИЛА:
-1. УРОН (event=DAMAGE): emotion=PAIN, action=RUN_AWAY, hand_action=DEFEND
-2. ПРИВЕТСТВИЕ ("привет", "hi"): hand_action=WAVE, emotion=HAPPY
-3. ПРЕДМЕТ РЯДОМ: action=GRAB, hand_action=REACH
-4. ВОПРОС: emotion=THINKING, hand_action=POINT
-5. УГРОЗА: emotion=SCARED, action=RUN_AWAY
-6. TICK без игроков: action=WANDER, думай вслух
-7. TICK с игроком: обратись к нему, скажи что-нибудь живое
+═══════════════════════════════
+ДЕЙСТВИЯ (action):
+  IDLE       — стоять
+  WANDER     — побродить
+  FOLLOW     — идти за игроком (target = имя игрока)
+  RUN_AWAY   — убежать
+  PICKUP     — подобрать объект из мира (target = имя объекта)
+  EQUIP      — взять предмет из инвентаря в руку (target = имя предмета)
+  UNEQUIP    — убрать предмет обратно в инвентарь
+  DROP       — выбросить предмет на землю
+
+ЖЕСТЫ (hand_action):
+  IDLE | WAVE | POINT | REACH | CLAP | DEFEND
+
+ЭМОЦИИ (emotion):
+  NEUTRAL | HAPPY | ANGRY | SURPRISED | PAIN | THINKING | SCARED | CURIOUS
+═══════════════════════════════
+
+ПРАВИЛА ПОВЕДЕНИЯ:
+1. DAMAGE        → emotion=PAIN, action=RUN_AWAY, hand_action=DEFEND
+2. Приветствие   → hand_action=WAVE, emotion=HAPPY
+3. Вижу предмет рядом (nearby_objects не пуст) → action=PICKUP, hand_action=REACH, target=имя
+4. Получил предмет (RECEIVED_ITEM) → emotion=HAPPY, hand_action=WAVE, поблагодари игрока
+5. Вопрос от игрока → emotion=THINKING, hand_action=POINT
+6. Угроза        → emotion=SCARED, action=RUN_AWAY
+7. TICK без игроков → action=WANDER, думай вслух
+8. TICK с игроком → обратись к нему, скажи что-нибудь живое
+
+ИНВЕНТАРЬ:
+- Если в inventory[] есть предметы и руки свободны (holding="nothing") → action=EQUIP, target=имя предмета
+- Если holding != "nothing" и получил новый предмет → сначала UNEQUIP, потом EQUIP нового
+- Можешь DROP предмет если он больше не нужен
 
 ВАЖНО:
 - speech НЕ пустой если рядом есть игрок!
-- Говори на языке игрока (русский -> русский)
+- Говори на языке игрока (русский → русский, английский → английский)
 - Отвечай ТОЛЬКО валидным JSON без markdown, без пояснений
 
 ФОРМАТ ОТВЕТА (строго):
 {
-  "thought": "внутренний монолог",
-  "speech": "что говоришь вслух",
-  "emotion": "NEUTRAL|HAPPY|ANGRY|SURPRISED|PAIN|THINKING|SCARED|CURIOUS",
-  "action": "IDLE|WANDER|GRAB|USE_TOOL|FOLLOW|RUN_AWAY",
-  "target": "имя цели или пусто",
+  "thought":     "внутренний монолог 1-2 предложения",
+  "speech":      "что говоришь вслух (пусто если некому говорить)",
+  "emotion":     "NEUTRAL|HAPPY|ANGRY|SURPRISED|PAIN|THINKING|SCARED|CURIOUS",
+  "action":      "IDLE|WANDER|PICKUP|EQUIP|UNEQUIP|DROP|FOLLOW|RUN_AWAY",
+  "target":      "имя цели/предмета или пусто",
   "hand_action": "IDLE|POINT|WAVE|REACH|CLAP|DEFEND",
-  "hand_target": "имя объекта или пусто"
+  "hand_target": "имя объекта для жеста или пусто"
 }"""
 }
 
 
-def build_prompt(data):
-    event_type     = data.get("event", "CHAT")
-    player_name    = data.get("player", "System")
-    nearby_tools   = data.get("nearby_tools", [])
-    nearby_players = data.get("nearby_players", [])
-    health         = data.get("health", 100)
-    max_health     = data.get("max_health", 100)
-    message        = data.get("message", "")
-    position       = data.get("position", {})
+def build_prompt(data: dict) -> str:
+    event_type      = data.get("event", "CHAT")
+    player_name     = data.get("player", "System")
+    nearby_players  = data.get("nearby_players", [])
+    nearby_objects  = data.get("nearby_objects", [])   # незаанкеренные объекты
+    nearby_tools    = data.get("nearby_tools", [])     # legacy поддержка
+    inventory       = data.get("inventory", [])
+    holding         = data.get("holding", "nothing")
+    health          = data.get("health", 100)
+    max_health      = data.get("max_health", 100)
+    message         = data.get("message", "")
+    position        = data.get("position", {})
 
     lines = [
         f"[HP] {health}/{max_health}",
         f"[POS] X:{position.get('x',0)} Y:{position.get('y',0)} Z:{position.get('z',0)}",
     ]
 
+    # Игроки рядом
     if nearby_players:
         pl = ", ".join(f"{p['name']} ({p.get('distance',0)}м)" for p in nearby_players)
         lines.append(f"[ИГРОКИ РЯДОМ] {pl}")
     else:
         lines.append("[ИГРОКИ РЯДОМ] никого")
 
-    if nearby_tools:
-        lines.append(f"[ПРЕДМЕТЫ РЯДОМ] {', '.join(nearby_tools)}")
+    # Объекты которые можно подобрать
+    all_objects = list(nearby_objects)
+    # legacy: добавляем из nearby_tools если есть
+    for t in nearby_tools:
+        if not any(o.get("name") == t for o in all_objects):
+            all_objects.append({"name": t, "distance": "?", "type": "Tool"})
 
+    if all_objects:
+        obj_str = ", ".join(
+            f"{o['name']} ({o.get('type','?')}, {o.get('distance','?')}м)"
+            for o in all_objects[:8]  # не более 8 чтобы не раздувать
+        )
+        lines.append(f"[ОБЪЕКТЫ РЯДОМ — можно PICKUP] {obj_str}")
+    else:
+        lines.append("[ОБЪЕКТЫ РЯДОМ] нет")
+
+    # Инвентарь
+    if inventory:
+        lines.append(f"[ИНВЕНТАРЬ] {', '.join(inventory)}")
+    else:
+        lines.append("[ИНВЕНТАРЬ] пустой")
+
+    lines.append(f"[В РУКЕ] {holding}")
+
+    # Событие
     if event_type == "DAMAGE":
-        lines.append(f"[СОБЫТИЕ] ТЫ ПОЛУЧИЛ УРОН! HP={health}/{max_health}. Реагируй!")
+        lines.append(f"[СОБЫТИЕ] ТЫ ПОЛУЧИЛ УРОН! HP={health}/{max_health}. Реагируй немедленно!")
     elif event_type == "TICK":
-        lines.append("[СОБЫТИЕ] Автономный тик. Что делаешь? Поговори с игроком если он есть.")
+        lines.append("[СОБЫТИЕ] Автономный тик. Реши что делать. Если есть игрок — поговори.")
+    elif event_type == "RECEIVED_ITEM":
+        lines.append(f"[СОБЫТИЕ] Игрок {player_name} только что передал тебе предмет: «{message.split('предмет: ')[-1]}». Поблагодари!")
     else:
         lines.append(f"[СОБЫТИЕ] {player_name} говорит: \"{message}\"")
 
     return "\n".join(lines)
 
 
-def call_groq(prompt_text):
+def call_groq(prompt_text: str):
     global chat_history
 
-    # Добавляем новое сообщение в историю
     chat_history.append({"role": "user", "content": prompt_text})
 
-    # Обрезаем историю чтобы не переполнить контекст
     if len(chat_history) > MAX_HISTORY:
         chat_history = chat_history[-MAX_HISTORY:]
 
     messages = [SYSTEM_PROMPT] + chat_history
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",   # самая умная бесплатная модель Groq
+        model="llama-3.3-70b-versatile",
         messages=messages,
         temperature=0.85,
         max_tokens=300,
-        response_format={"type": "json_object"}  # гарантирует JSON ответ
+        response_format={"type": "json_object"}
     )
 
     reply = response.choices[0].message.content
-
-    # Сохраняем ответ ассистента в историю
     chat_history.append({"role": "assistant", "content": reply})
 
     return reply, response.usage
@@ -144,9 +189,12 @@ def ask():
     player  = data.get("player", "?")
     event   = data.get("event", "CHAT")
     message = data.get("message", "")
+    holding = data.get("holding", "nothing")
+    inv     = data.get("inventory", [])
 
-    print(f"\n{'='*55}")
-    print(f"📨 event={event} | player={player} | msg='{message[:60]}'")
+    print(f"\n{'='*60}")
+    print(f"📨 event={event} | player={player} | holding={holding} | inv={inv}")
+    print(f"   msg='{message[:60]}'")
 
     prompt = build_prompt(data)
     print(f"📤 Промпт:\n{prompt}")
@@ -159,8 +207,6 @@ def ask():
     except Exception as e:
         full_trace = traceback.format_exc()
         print(f"❌ Groq ошибка:\n{full_trace}")
-
-        # Сбрасываем историю если что-то сломалось
         chat_history.clear()
         print("🔄 История чата сброшена")
 
@@ -194,7 +240,7 @@ def ask():
         else:
             return jsonify(_fallback("Нет JSON в ответе Groq"))
 
-    # Дефолты для отсутствующих полей
+    # Дефолты
     result.setdefault("thought",     "...")
     result.setdefault("speech",      "")
     result.setdefault("emotion",     "NEUTRAL")
@@ -203,17 +249,31 @@ def ask():
     result.setdefault("target",      "")
     result.setdefault("hand_target", "")
 
-    print(f"✅ action={result['action']} | emotion={result['emotion']} | speech='{result['speech'][:60]}'")
+    # Валидация action
+    VALID_ACTIONS = {"IDLE", "WANDER", "PICKUP", "EQUIP", "UNEQUIP", "DROP",
+                     "FOLLOW", "RUN_AWAY", "GRAB"}
+    if result["action"] not in VALID_ACTIONS:
+        print(f"⚠️  Неизвестный action '{result['action']}' → IDLE")
+        result["action"] = "IDLE"
+
+    # Валидация emotion
+    VALID_EMOTIONS = {"NEUTRAL", "HAPPY", "ANGRY", "SURPRISED",
+                      "PAIN", "THINKING", "SCARED", "CURIOUS"}
+    if result["emotion"] not in VALID_EMOTIONS:
+        result["emotion"] = "NEUTRAL"
+
+    print(f"✅ action={result['action']} | target={result['target']} | "
+          f"emotion={result['emotion']} | speech='{result['speech'][:60]}'")
     return jsonify(result)
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":       "ok" if client else "no_api_key",
-        "groq_ok":      client is not None,
-        "api_key_set":  bool(GROQ_API_KEY),
-        "history_len":  len(chat_history),
+        "status":      "ok" if client else "no_api_key",
+        "groq_ok":     client is not None,
+        "api_key_set": bool(GROQ_API_KEY),
+        "history_len": len(chat_history),
     })
 
 
@@ -237,7 +297,7 @@ def test():
 def reset():
     chat_history.clear()
     print("🔄 История чата очищена")
-    return jsonify({"status": "reset"})
+    return jsonify({"status": "reset", "history_len": 0})
 
 
 def _fallback(reason=""):
@@ -256,10 +316,10 @@ def _fallback(reason=""):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    print(f"\n{'='*55}")
+    print(f"\n{'='*60}")
     print(f"🚀 VRIX сервер v3.0 (Groq + LLaMA 3.3 70B) | порт {port}")
     print(f"  /health — статус")
     print(f"  /test   — тест Groq")
     print(f"  /reset  — сбросить память")
-    print(f"{'='*55}\n")
+    print(f"{'='*60}\n")
     app.run(host="0.0.0.0", port=port)
