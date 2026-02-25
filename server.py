@@ -12,7 +12,6 @@ import json
 import traceback
 import re
 import time
-from collections import defaultdict
 from flask import Flask, request, jsonify
 from groq import Groq
 
@@ -41,11 +40,6 @@ chat_history  = {}          # история диалога по игроку
 player_memory = {}          # долгосрочная память событий
 player_personality = {}     # ✨ НОВИНКА: статы личности
 session_moods = {}          # ✨ НОВИНКА: настроение между сессиями
-
-# ✨ НОВИНКА: Rate-limiting на игрока
-request_timestamps = defaultdict(list)
-RATE_LIMIT_WINDOW  = 10    # секунд
-RATE_LIMIT_MAX     = 5     # запросов в окне
 
 # ✨ НОВИНКА: Глобальная статистика
 global_stats = {
@@ -216,20 +210,6 @@ def add_memory(player_name: str, event_type: str, detail: str):
 def get_memory_summary(player_name: str, count: int = 7) -> list:
     mem = player_memory.get(player_name, [])
     return mem[-count:] if mem else []   # БАГ ИСПРАВЛЕН: был пробел перед []
-
-# ============================================================
-# RATE LIMITING (НОВИНКА ✨)
-# ============================================================
-def check_rate_limit(player_name: str) -> bool:
-    """Возвращает True если запрос разрешён, False если превышен лимит."""
-    now = time.time()
-    timestamps = request_timestamps[player_name]
-    # Очищаем старые записи
-    timestamps[:] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
-    if len(timestamps) >= RATE_LIMIT_MAX:
-        return False
-    timestamps.append(now)
-    return True
 
 # ============================================================
 # ПОСТРОЕНИЕ ПРОМПТА (улучшен)
@@ -474,19 +454,6 @@ def ask():
 
     global_stats["total_requests"] += 1
 
-    # ✨ Rate limiting
-    if not check_rate_limit(player):
-        print(f"Rate limit для {player}!")
-        return jsonify({
-            "thought":     "Слишком много запросов...",
-            "speech":      "Подожди немного!",
-            "emotion":     "NEUTRAL",
-            "action":      "IDLE",
-            "hand_action": "IDLE",
-            "target":      "",
-            "hand_target": ""
-        })
-
     print(f"\n{'='*52}")
     print(f"v6.0 | event={event} | источник={player} | msg='{message[:60]}'")
 
@@ -614,7 +581,6 @@ def reset():
     player_memory.clear()
     player_personality.clear()
     session_moods.clear()
-    request_timestamps.clear()
     global_stats.update({"total_requests":0,"total_errors":0,"npc_dialogs":0,"damage_events":0,"items_received":0})
     print("Глобальный сброс всей памяти произведен!")
     return jsonify({"status": "reset"})
@@ -626,7 +592,6 @@ def reset_player(player_name: str):
     chat_history.pop(player_name, None)
     player_memory.pop(player_name, None)
     player_personality.pop(player_name, None)
-    request_timestamps.pop(player_name, None)
     print(f"Сброс данных игрока: {player_name}")
     return jsonify({"status": "reset", "player": player_name})
 
@@ -664,7 +629,6 @@ if __name__ == "__main__":
     print(f"\n{'='*54}")
     print(f"✨ VRIX сервер v6.0 (LLaMA 3.3 70B | Полный рефактор)")
     print(f"   Порт {port}")
-    print(f"   Rate limit: {RATE_LIMIT_MAX} req/{RATE_LIMIT_WINDOW}s на игрока")
     print(f"   Эндпоинты: /ask  /health  /test  /reset  /stats  /memory/<name>")
     print(f"{'='*54}\n")
     app.run(host="0.0.0.0", port=port)
