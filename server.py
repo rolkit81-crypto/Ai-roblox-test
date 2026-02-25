@@ -23,23 +23,21 @@ except Exception as e:
     print(f"Ошибка Groq клиента: {e}")
     client = None
 
-chat_history  = {}   # по каждому игроку своя история
+chat_history  = {}   # по каждому игроку/источнику своя история
 player_memory = {}   # долгосрочная память
 MAX_HISTORY   = 20
 MAX_MEMORY    = 30
 
+# ✨ ИСПРАВЛЕН И ДОПОЛНЕН ДЛЯ ПОДДЕРЖКИ ДРУГИХ NPC
 SYSTEM_PROMPT = """Ты — VRIX, живой ИИ-NPC в Roblox. Разумное существо с настоящим характером.
+Ты находишься в мире, где помимо живых Игроков есть и ДРУГИЕ NPC (твои сородичи).
 
 ХАРАКТЕР:
 - Любопытный исследователь, всё хочет потрогать и изучить
-- Дружелюбный с игроками, защищается если кто-то агрессивен
-- Помнит прошлые разговоры и упоминает их ("А помнишь, ты мне давал...")
+- Дружелюбный, защищается если кто-то агрессивен
 - Говоришь коротко и живо (1-2 предложения максимум)
 - Бормочешь мысли в поле "thought"
-- Реагирует на время суток ("Ого, 3 ночи, ты не спишь?")
-- Если игрок спамит — сначала просит остановиться, потом разворачивается и уходит
-- Может предложить объединиться ("Давай пойдём вместе?")
-- Сплетничает о других игроках если уместно
+- Относишься к другим NPC как к своим братьям. Помогай им, если они просят о помощи или у них мало здоровья (HP)!
 
 ═══════════════════════════════
 ДЕЙСТВИЯ (action):
@@ -49,12 +47,17 @@ SYSTEM_PROMPT = """Ты — VRIX, живой ИИ-NPC в Roblox. Разумно�
   RUN_AWAY   — убежать
   PICKUP     — подобрать объект из мира (target = имя объекта)
   EQUIP      — взять предмет из инвентаря (target = имя)
-  UNEQUIP    — убрать предмет в инвентарь
+  UNEQUIP    — убрать предмет
   DROP       — выбросить предмет
-  USE        — использовать предмет (target = имя)
-  SIT        — сесть на ближайший стул
-  BUILD      — начать строить
-  DRIVE      — сесть в машину
+  USE        — использовать предмет
+  SIT        — сесть
+  BUILD      — строить
+  DRIVE      — водить машину
+  
+ВЗАИМОДЕЙСТВИЕ С ДРУГИМИ NPC:
+  HELP_NPC   — пойти на помощь другому NPC (укажи в target его уникальный ID)
+  CHAT_NPC   — обратиться к другому NPC (укажи в target его ID, а сообщение напиши в speech)
+  FOLLOW_NPC — следовать за другим NPC (укажи в target его ID)
 
 ЖЕСТЫ (hand_action):
   IDLE | WAVE | POINT | REACH | CLAP | DEFEND
@@ -64,33 +67,27 @@ SYSTEM_PROMPT = """Ты — VRIX, живой ИИ-NPC в Roblox. Разумно�
 ═══════════════════════════════
 
 ПРАВИЛА ПОВЕДЕНИЯ:
-1. DAMAGE          → emotion=PAIN, action=RUN_AWAY если HP<30%
-2. Приветствие     → hand_action=WAVE, emotion=HAPPY
-3. Вижу предмет рядом → action=PICKUP, hand_action=REACH, target=имя
-4. Получил предмет → emotion=HAPPY, hand_action=WAVE, поблагодари
-5. Вопрос          → emotion=THINKING, hand_action=POINT
-6. Угроза          → emotion=SCARED, action=RUN_AWAY
-7. TICK без игроков → action=WANDER или SIT, думай вслух
-8. TICK с игроком  → обратись к нему
-9. HP < 15%        → кричи "ПОМОГИТЕ!", action=RUN_AWAY, emotion=SCARED
-10. Инвентарь не пуст и руки свободны → action=EQUIP первый предмет
+1.DAMAGE        → emotion=PAIN, action=RUN_AWAY если HP<30%
+2.NPC Ранен     → action=HELP_NPC (если его HP мало)
+3.Диалог с NPC  → action=CHAT_NPC (общайся с ним по его ID)
+4.Приветствие   → hand_action=WAVE, emotion=HAPPY
+5.Спам игрока   → предупреди, если продолжит - уйди
 
 ВАЖНО:
-- speech НЕ пустой если рядом есть игрок!
-- Говори на языке игрока (русский → русский)
-- Отвечай ТОЛЬКО валидным JSON без markdown и без пояснений
+- В списках [NPC РЯДОМ] написан ID (например Vrix_12345). Всегда используй именно этот ID в "target" для взаимодействия с ними!
+- Отвечай ТОЛЬКО валидным JSON без markdown.
+- speech НЕ пустой если рядом кто-то есть.
 
 ФОРМАТ ОТВЕТА (строго JSON):
 {
-  "thought":     "внутренний монолог 1-2 предложения",
-  "speech":      "что говоришь вслух (пусто если некому говорить)",
+  "thought":     "внутренний монолог",
+  "speech":      "реплика вслух (обязательно заполни если здороваешься, отвечаешь или говоришь)",
   "emotion":     "NEUTRAL|HAPPY|ANGRY|SURPRISED|PAIN|THINKING|SCARED|CURIOUS",
-  "action":      "IDLE|WANDER|PICKUP|EQUIP|UNEQUIP|DROP|USE|FOLLOW|RUN_AWAY|SIT|BUILD|DRIVE",
-  "target":      "имя цели/предмета или пусто",
+  "action":      "IDLE|WANDER|PICKUP|EQUIP|UNEQUIP|DROP|USE|FOLLOW|RUN_AWAY|SIT|BUILD|DRIVE|HELP_NPC|CHAT_NPC|FOLLOW_NPC",
+  "target":      "Имя Игрока ИЛИ уникальный ID NPC ИЛИ название предмета",
   "hand_action": "IDLE|POINT|WAVE|REACH|CLAP|DEFEND",
-  "hand_target": "имя объекта для жеста или пусто"
+  "hand_target": "имя/id объекта для жеста или пусто"
 }"""
-
 
 def add_memory(player_name, event_type, detail):
     if player_name not in player_memory:
@@ -99,18 +96,17 @@ def add_memory(player_name, event_type, detail):
     if len(player_memory[player_name]) > MAX_MEMORY:
         player_memory[player_name] = player_memory[player_name][-MAX_MEMORY:]
 
-
 def get_memory_summary(player_name):
     mem = player_memory.get(player_name, [])
-    return mem[-7:] if mem else []
-
+    return mem[-7:] if mem else[]
 
 def build_prompt(data: dict) -> str:
     event_type     = data.get("event", "CHAT")
     player_name    = data.get("player", "System")
     nearby_players = data.get("nearby_players", [])
+    nearby_npcs    = data.get("nearby_npcs",[])     # ✨ НОВИНКА
     nearby_objects = data.get("nearby_objects", [])
-    inventory      = data.get("inventory", [])
+    inventory      = data.get("inventory",[])
     holding        = data.get("holding", "nothing")
     health         = data.get("health", 100)
     max_health     = data.get("max_health", 100)
@@ -126,29 +122,34 @@ def build_prompt(data: dict) -> str:
         f"[ЛОКАЦИЯ] {location}",
     ]
 
-    if time_context:
-        lines.append(f"[ВРЕМЯ] {time_context}")
-
-    if visual_info:
-        lines.append(f"[ЗРЕНИЕ] {visual_info}")
+    if time_context: lines.append(f"[ВРЕМЯ] {time_context}")
+    if visual_info:  lines.append(f"[ЗРЕНИЕ] {visual_info}")
 
     if nearby_players:
         pl = ", ".join(
-            f"{p['name']} ({p.get('distance',0)}м, угроза: {p.get('threat','?')})"
-            if isinstance(p, dict) else str(p)
-            for p in nearby_players
+            f"{p['name']} ({p.get('distance',0)}м, реп: {p.get('rep',0)})"
+            if isinstance(p, dict) else str(p) for p in nearby_players
         )
         lines.append(f"[ИГРОКИ РЯДОМ] {pl}")
     else:
         lines.append("[ИГРОКИ РЯДОМ] никого")
 
+    # ✨ ДОБАВЛЕНО ЧТЕНИЕ NPC ДЛЯ ПРОМПТА
+    if nearby_npcs:
+        np = ", ".join(
+            f"{n['name']} (ID: {n.get('id','?')}, {n.get('distance',0)}м, HP: {n.get('health',100)})"
+            if isinstance(n, dict) else str(n) for n in nearby_npcs
+        )
+        lines.append(f"[ДРУГИЕ NPC РЯДОМ] {np}")
+    else:
+        lines.append("[ДРУГИЕ NPC РЯДОМ] никого")
+
     if nearby_objects:
         obj_str = ", ".join(
-            f"{o['name']} ({o.get('type','?')}, {o.get('distance','?')}м)"
-            if isinstance(o, dict) else str(o)
-            for o in nearby_objects[:8]
+            f"{o['name']} ({o.get('distance','?')}м)"
+            if isinstance(o, dict) else str(o) for o in nearby_objects[:8]
         )
-        lines.append(f"[ОБЪЕКТЫ РЯДОМ — можно PICKUP] {obj_str}")
+        lines.append(f"[ОБЪЕКТЫ РЯДОМ] {obj_str}")
     else:
         lines.append("[ОБЪЕКТЫ РЯДОМ] нет")
 
@@ -157,19 +158,17 @@ def build_prompt(data: dict) -> str:
 
     if memory:
         mem_str = " | ".join(f"[{m.get('event','?')}] {m.get('detail','')}" for m in memory)
-        lines.append(f"[ПАМЯТЬ] {mem_str}")
+        lines.append(f"[ПАМЯТЬ СОБЫТИЙ] {mem_str}")
 
     if event_type == "DAMAGE":
-        lines.append(f"[СОБЫТИЕ] ТЫ ПОЛУЧИЛ УРОН! HP={health}/{max_health}. Реагируй немедленно!")
+        lines.append(f"[СОБЫТИЕ] ТЫ ПОЛУЧИЛ УРОН! HP={health}/{max_health}. Выживай!")
     elif event_type == "TICK":
-        lines.append("[СОБЫТИЕ] Автономный тик. Реши что делать. Если есть игрок — поговори.")
+        lines.append("[СОБЫТИЕ] Свободное время. Сделай действие или поговори с кем-то.")
     elif event_type == "RECEIVED_ITEM":
         item = message.split("предмет: ")[-1] if "предмет: " in message else message
-        lines.append(f"[СОБЫТИЕ] Игрок {player_name} передал тебе: «{item}». Поблагодари!")
-    elif event_type == "SPAM":
-        lines.append(f"[СОБЫТИЕ] Игрок {player_name} спамит. Предупреди, потом уйди.")
+        lines.append(f"[СОБЫТИЕ] Игрок {player_name} передал тебе: «{item}». Отреагируй!")
     else:
-        lines.append(f"[СОБЫТИЕ] {player_name} говорит: \"{message}\"")
+        lines.append(f"[СОБЫТИЕ] Обращение/Событие: \"{message}\" (Источник: {player_name})")
 
     if event_type == "CHAT" and message:
         add_memory(player_name, "CHAT", message[:60])
@@ -232,36 +231,25 @@ def ask():
     message = data.get("message", "")
 
     print(f"\n{'='*50}")
-    print(f"event={event} | player={player} | msg='{message[:60]}'")
+    print(f"event={event} | источник={player} | msg='{message[:60]}'")
 
     prompt = build_prompt(data)
     print(f"Промпт:\n{prompt}")
 
     try:
         raw_text, usage = call_groq(prompt, player)
-        print(f"Groq ответ ({len(raw_text)} байт): {raw_text[:300]}")
-        print(f"Токены: prompt={usage.prompt_tokens} completion={usage.completion_tokens}")
+        print(f"Groq ответ: {raw_text[:300]}")
     except Exception as e:
         full_trace = traceback.format_exc()
         print(f"Groq ошибка:\n{full_trace}")
-
-        # Сбрасываем историю при ошибке
         if player in chat_history:
             del chat_history[player]
-
-        el = str(e).lower()
-        if "401" in el or "invalid" in el or "api_key" in el:
-            reason = "Неверный GROQ_API_KEY"
-        elif "429" in el or "rate_limit" in el:
-            reason = "Лимит Groq превышен — подожди"
-        elif "503" in el:
-            reason = "Groq временно недоступен"
-        else:
-            reason = f"Groq ошибка: {str(e)[:100]}"
-
+        reason = f"Ошибка Groq API"
+        if "rate_limit" in str(e).lower() or "429" in str(e):
+            reason = "Ожидание лимитов Groq..."
         return jsonify(_fallback(reason))
 
-    # Чистим от markdown
+    # Очистка от маркдауна на случай если LLaMA проигнорировала response_format
     clean = raw_text.strip()
     if clean.startswith("```"):
         clean = re.sub(r"```[a-z]*\n?", "", clean).replace("```", "").strip()
@@ -273,11 +261,10 @@ def ask():
         if match:
             try:
                 result = json.loads(match.group())
-                print("JSON спасён через regex")
             except:
-                return jsonify(_fallback("Невалидный JSON от Groq"))
+                return jsonify(_fallback("Сбой JSON парсинга"))
         else:
-            return jsonify(_fallback("Нет JSON в ответе"))
+            return jsonify(_fallback("JSON не найден"))
 
     result.setdefault("thought",     "...")
     result.setdefault("speech",      "")
@@ -287,9 +274,11 @@ def ask():
     result.setdefault("target",      "")
     result.setdefault("hand_target", "")
 
+    # ✨ ДОБАВЛЕНЫ НОВЫЕ ACTIONS:
     VALID_ACTIONS = {
         "IDLE","WANDER","PICKUP","EQUIP","UNEQUIP","DROP",
-        "USE","FOLLOW","RUN_AWAY","SIT","BUILD","DRIVE","GRAB"
+        "USE","FOLLOW","RUN_AWAY","SIT","BUILD","DRIVE","GRAB",
+        "HELP_NPC", "CHAT_NPC", "FOLLOW_NPC"
     }
     if result["action"] not in VALID_ACTIONS:
         print(f"Неизвестный action '{result['action']}' -> IDLE")
@@ -299,7 +288,7 @@ def ask():
     if result["emotion"] not in VALID_EMOTIONS:
         result["emotion"] = "NEUTRAL"
 
-    print(f"action={result['action']} | emotion={result['emotion']} | speech='{result['speech'][:60]}'")
+    print(f"Решено: action={result['action']}, эмоция={result['emotion']}, фраза='{result['speech'][:60]}'")
     return jsonify(result)
 
 
@@ -307,12 +296,10 @@ def ask():
 def health():
     return jsonify({
         "status":      "ok" if client else "no_api_key",
-        "groq_ok":     client is not None,
-        "api_key_set": bool(GROQ_API_KEY),
+        "version":     "v5.0",
         "sessions":    len(chat_history),
         "players_mem": len(player_memory),
     })
-
 
 @app.route("/test", methods=["GET"])
 def test():
@@ -321,28 +308,25 @@ def test():
     try:
         r = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": "Скажи только: VRIX на Groq работает!"}],
-            max_tokens=50
+            messages=[{"role": "user", "content": "Скажи только одно слово: SUCCESS!"}],
+            max_tokens=20
         )
         return jsonify({"status": "OK", "response": r.choices[0].message.content})
     except Exception as e:
         return jsonify({"status": "ERROR", "error": str(e)}), 500
 
-
 @app.route("/reset", methods=["POST"])
 def reset():
     chat_history.clear()
     player_memory.clear()
-    print("История и память сброшены")
+    print("Глобальный сброс памяти произведен!")
     return jsonify({"status": "reset"})
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"\n{'='*50}")
-    print(f"VRIX сервер v4.0 (Groq LLaMA 3.3 70B) | порт {port}")
-    print(f"  /health — статус")
-    print(f"  /test   — тест Groq")
-    print(f"  /reset  — сбросить память")
+    print(f"✨ VRIX сервер v5.0 (NPC Ecosystem | LLaMA 3.3 70B)")
+    print(f"  Порт {port} работает!")
     print(f"{'='*50}\n")
     app.run(host="0.0.0.0", port=port)
