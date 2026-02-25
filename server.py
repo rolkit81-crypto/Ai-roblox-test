@@ -116,6 +116,12 @@ def build_prompt(data: dict) -> str:
     location       = data.get("location", "STREET")
     time_context   = data.get("time_context", "")
     memory         = data.get("memory", get_memory_summary(player_name))
+    
+    # ✨ ДОБАВЛЕНО: внутреннее состояние
+    mood           = data.get("mood", 0.5)
+    tiredness      = data.get("tiredness", 0)
+    hunger         = data.get("hunger", 0)
+    known_locs     = data.get("known_locations", {})
 
     lines = [
         f"[HP] {health}/{max_health}",
@@ -124,6 +130,9 @@ def build_prompt(data: dict) -> str:
 
     if time_context: lines.append(f"[ВРЕМЯ] {time_context}")
     if visual_info:  lines.append(f"[ЗРЕНИЕ] {visual_info}")
+
+    # Внутреннее состояние (для информации)
+    lines.append(f"[СОСТОЯНИЕ] настроение: {mood:.2f}, усталость: {tiredness:.2f}, голод: {hunger:.2f}")
 
     if nearby_players:
         pl = ", ".join(
@@ -134,10 +143,9 @@ def build_prompt(data: dict) -> str:
     else:
         lines.append("[ИГРОКИ РЯДОМ] никого")
 
-    # ✨ ДОБАВЛЕНО ЧТЕНИЕ NPC ДЛЯ ПРОМПТА
     if nearby_npcs:
         np = ", ".join(
-            f"{n['name']} (ID: {n.get('id','?')}, {n.get('distance',0)}м, HP: {n.get('health',100)})"
+            f"{n['name']} (ID: {n.get('id','?')}, {n.get('distance',0)}м, HP: {n.get('health',100)}, отнош: {n.get('relation',0)})"
             if isinstance(n, dict) else str(n) for n in nearby_npcs
         )
         lines.append(f"[ДРУГИЕ NPC РЯДОМ] {np}")
@@ -159,6 +167,11 @@ def build_prompt(data: dict) -> str:
     if memory:
         mem_str = " | ".join(f"[{m.get('event','?')}] {m.get('detail','')}" for m in memory)
         lines.append(f"[ПАМЯТЬ СОБЫТИЙ] {mem_str}")
+
+    # Известные локации (кратко)
+    if known_locs:
+        locs = ", ".join(known_locs.keys())
+        lines.append(f"[ИЗВЕСТНЫЕ МЕСТА] {locs}")
 
     if event_type == "DAMAGE":
         lines.append(f"[СОБЫТИЕ] ТЫ ПОЛУЧИЛ УРОН! HP={health}/{max_health}. Выживай!")
@@ -296,7 +309,7 @@ def ask():
 def health():
     return jsonify({
         "status":      "ok" if client else "no_api_key",
-        "version":     "v5.0",
+        "version":     "v5.2",
         "sessions":    len(chat_history),
         "players_mem": len(player_memory),
     })
@@ -326,7 +339,7 @@ def reset():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"\n{'='*50}")
-    print(f"✨ VRIX сервер v5.0 (NPC Ecosystem | LLaMA 3.3 70B)")
+    print(f"✨ VRIX сервер v5.2 (NPC Ecosystem | LLaMA 3.3 70B)")
     print(f"  Порт {port} работает!")
     print(f"{'='*50}\n")
     app.run(host="0.0.0.0", port=port)
